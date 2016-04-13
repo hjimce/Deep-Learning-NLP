@@ -1,12 +1,12 @@
 #coding=utf-8
 from collections import OrderedDict
-import cPickle
 import os
 import random
 import numpy
 import theano
 from theano import tensor as T
-from Preprocess.LoadData import  Segment
+from Preprocess.LoadData import  Segment,write
+import numpy as np
 
 
 
@@ -19,6 +19,7 @@ def shuffle(lol, seed):
 
 #输入一个长句，我们根据窗口获取每个win内的数据，作为一个样本。或者也可以称之为作为RNN的某一时刻的输入
 def contextwin(l, win):
+
     assert (win % 2) == 1
     assert win >= 1
     l = list(l)
@@ -70,46 +71,50 @@ class RNNSLU(object):
 
         self.params = [self.emb, self.wx, self.wh, self.w,self.bh, self.b, self.h0]#所有待学习的参数
 
-        idxs = T.imatrix()
-        x = self.emb[idxs].reshape((idxs.shape[0], de*cs))
-        y_sentence = T.ivector('y_sentence')  # 训练样本标签
+        idxs = T.itensor3()
+        x = self.emb[idxs].reshape((idxs.shape[0],idxs.shape[1],de*idxs.shape[2]))
+        y_sentence = T.imatrix('y_sentence')  # 训练样本标签,二维的(batch,sentence)
 
-        def recurrence(x_t, h_tm1):
+
+        def step(x_t, h_tm1):
             h_t = T.nnet.sigmoid(T.dot(x_t, self.wx) + T.dot(h_tm1, self.wh) + self.bh)#通过ht-1、x计算隐藏层
-            s_t = T.nnet.softmax(T.dot(h_t, self.w) + self.b)#计算输出层
-            return [h_t, s_t]
+            s_temp=T.dot(h_t, self.w) + self.b#由于softmax不支持三维矩阵操作，所以这边需要对其进行reshape成2D，计算完毕后再reshape成3D
+            return h_t, s_temp
+        [h,s_temp], _ = theano.scan(step,sequences=x,outputs_info=[T.ones(shape=(x.shape[1],self.h0.shape[0])) * self.h0, None])
+        p_y =T.nnet.softmax(T.reshape(s_temp,(s_temp.shape[0]*s_temp.shape[1],-1)))
+        p_y=T.reshape(p_y,s_temp.shape)
+        #h,p_y=step(x, self.h0)#p_y为三维矩阵，表示每个样本的值
 
-        [h, s], _ = theano.scan(fn=recurrence,
-                                sequences=x,
-                                outputs_info=[self.h0, None],
-                                n_steps=x.shape[0])
-        #神经网络的输出
-        p_y_given_x_sentence = s[:, 0, :]
-        y_pred = T.argmax(p_y_given_x_sentence, axis=1)
+        loss=self.nll_multiclass(p_y,y_sentence)+0.0*((self.wx**2).sum()+(self.wh**2).sum()+(self.w**2).sum())
 
-
-        #计算损失函数，然后进行梯度下降
         lr = T.scalar('lr')#学习率，一会儿作为输入参数
-        sentence_nll = -T.mean(T.log(p_y_given_x_sentence)[T.arange(x.shape[0]), y_sentence])
-        sentence_gradients = T.grad(sentence_nll, self.params)
+
+        #神经网络的输出
+        sentence_gradients = T.grad(loss, self.params)
+
+
+
+
+
         sentence_updates = OrderedDict((p, p - lr*g) for p, g in zip(self.params, sentence_gradients))
-
-
-        #构造预测函数、训练函数，输入数据idxs每一行是一个样本(也就是一个窗口内的序列索引)
-        self.classify = theano.function(inputs=[idxs], outputs=y_pred)
-        self.sentence_train = theano.function(inputs=[idxs, y_sentence, lr],outputs=sentence_nll,updates=sentence_updates)
+        self.sentence_train = theano.function(inputs=[idxs,y_sentence,lr],outputs=loss,updates=sentence_updates)
         #词向量归一化，因为我们希望训练出来的向量是一个归一化向量
         self.normalize = theano.function(inputs=[],updates={self.emb:self.emb /T.sqrt((self.emb**2).sum(axis=1)).dimshuffle(0, 'x')})
 
+        #构造预测函数、训练函数，输入数据idxs每一行是一个样本(也就是一个窗口内的序列索引)
+        y_pred = T.argmax(p_y,axis=-1)
+        self.classify = theano.function(inputs=[idxs,y_sentence], outputs=[loss,y_pred])
+
     #训练
-    def train(self, x, y, window_size, learning_rate):
-
-        cwords = contextwin(x, window_size)#获取训练样本
-        words = map(lambda x: numpy.asarray(x).astype('int32'), cwords)#数据格式转换
-        labels = y
-
-        self.sentence_train(words, labels, learning_rate)
+    def train(self, x, y,learning_rate):
+        loss=self.sentence_train(x, y, learning_rate)
         self.normalize()
+        return  loss
+    def nll_multiclass(self,p_y_given_x, y):
+        p_y =p_y_given_x
+        p_y_m = T.reshape(p_y, (p_y.shape[0] * p_y.shape[1], -1))
+        y_f = y.flatten(ndim=1)
+        return -T.mean(T.log(p_y_m)[T.arange(p_y_m.shape[0]), y_f])
 
     #保存、加载训练模型
     def save(self, folder):
@@ -120,48 +125,114 @@ class RNNSLU(object):
         for param in self.params:
             param.set_value(numpy.load(os.path.join(folder,
                             param.name + '.npy')))
+#为了采用batch训练，需要保证每个句子长度相同，因此这里采用均匀切分，不过有一个缺陷那就是有可能某个词刚好被切开
+def convert2batch(dic,filename,win,length=3):
+    x,y=dic.encode_index(filename)#创建训练数据的索引序列
+    x2,y2=dic.encode_index('Data/msr/pku_training.utf8')#创建训练数据的索引序列
+    x3,y3=dic.encode_index('Data/msr/1.txt')
+    x4,y4=dic.encode_index('Data/msr/1998.txt')
 
 
-def main():
 
-    train_set, valid_set,test_set, dicts = cPickle.load(open("atis.fold3.pkl//atis.fold3.pkl"))#加载训练数据
-    idx2label = dict((k, v) for v, k in dicts['labels2idx'].iteritems())#每个类别标签名字所对应的索引
-    idx2word = dict((k, v) for v, k in dicts['words2idx'].iteritems())#每个词的索引
-    train_lex, train_ne, train_y = train_set
-    valid_lex, valid_ne, valid_y = valid_set
-    test_lex, test_ne, test_y = test_set
+    x=x+x2+x3+x4
+    y=y+y2+y3+y4
+
+
+    train_batchxs=[]
+    train_batchys=[]
+
+
+
+
+    train_seqx=[x[i:i+length] for i in range(len(x)) if i%length==0]
+    train_seqy=[y[i:i+length] for i in range(len(y)) if i%length==0]
+    for x,y in zip(train_seqx,train_seqy):
+        if len(x)!=length or len(y)!=length:
+            continue
+        s=contextwin(x,win)
+        train_batchxs.append(s)
+        train_batchys.append(y)
+
+    #每个句子的长度不同，不能直接转换
+    return  np.asarray(train_batchxs,dtype=np.int32),np.asarray(train_batchys,dtype=np.int32)
+
+
+#RNN分词
+def segment_train(dic,filename):
+    trainx,trainy=convert2batch(dic,filename,5,1000)
+
+    '''for i,j in zip(train_xbatchs,train_ybatchs):
+        for ui,uj in zip(i,j):
+            print train_data.decode_index([ui])[0],train_data.decode_index([uj],is_label=True)'''
+
+    '''label=train_data.decode_index(train_y,is_label=True)
+    for i,j in zip(word,label):
+        print i,j
+    #write(word,'label.txt')
+    #write(y,'label2.txt')'''
+
 
     #计算相关参数
-    vocsize = len(set(reduce(lambda x, y: list(x) + list(y),train_lex + valid_lex + test_lex)))#计算词的个数
-    nclasses = len(set(reduce(lambda x, y: list(x)+list(y),train_y + test_y + valid_y)))#计算样本类别个数
-    winsize=7#窗口大小
+    vocsize = len(dic.word2index)#计算词的个数
+    nclasses =len(dic.label2index)#标签数为B、M、E、S
+    winsize=5#窗口大小
     ndim=50#词向量维度
     nhidden=200#隐藏层的神经元个数
-    learn_rate=0.0970806646812754#梯度下降学习率
+    learn_rate=0.5#梯度下降学习率
 
     #构建RNN，开始训练
     rnn = RNNSLU(nh=nhidden,nc=nclasses,ne=vocsize,de=ndim,cs=winsize)
+
+    batch_size=64
+    n_train_batch=trainx.shape[0]/batch_size
+    rnn.load('model/')
     epoch=0
-    while epoch<10:
-        shuffle([train_lex, train_ne, train_y], 345)
-        for i, (x, y) in enumerate(zip(train_lex, train_y)):
-            rnn.train(x, y,winsize,learn_rate)
-        print epoch
+    while epoch<20:
+        shuffle([trainx,trainy], 345)
+        loss=0
+        for i in range(n_train_batch):
+                batx=trainx[i*batch_size:(i+1)*batch_size]
+                baty=trainy[i*batch_size:(i+1)*batch_size]
+                decay_lr=learn_rate*0.5**(epoch/50)
+                loss+=rnn.train(batx,baty,decay_lr)
+        print 'epoch:',epoch,'\tloss:',loss/n_train_batch
         epoch+=1
+    rnn.save('model/')
+    return  rnn
+def segment_test(model,dic,test_file):
+    #model.load('model/')#加载训练参数
+    x,y=dic.encode_index(test_file)#创建训练数据的索引序列
+    xjieba,yjieba=dic.encode_index('Data/msr/msr_test_jieba_result.txt')#创建训练数据的索引序列
+    test_batchxs=[]
+    test_batchys=[]
+    s=contextwin(x,5)
+    test_batchxs.append(s)
+    test_batchys.append(y)
+
+
+    loss,pre=model.classify(np.asarray(test_batchxs),np.asarray(test_batchys))
+    print 'loss:',loss
+    print pre.shape
+
+
     #测试集的输出标签
-    predictions_test = [map(lambda x: idx2label[x],rnn.classify(numpy.asarray(contextwin(x,winsize)).astype('int32'))) for x in test_lex]
+
+    predictions_label=dic.decode_index(pre[0],is_label=True)
+    groudtrue_label=dic.decode_index(y,is_label=True)
+    words_test=dic.decode_index(x)
+
+
+    for k,(w,i,j) in enumerate(zip(words_test,groudtrue_label,predictions_label)):
+        print w,i,j
+
     #测试集的正确标签、及其对应的文本
-    groundtruth_test = [map(lambda x: idx2label[x], y) for y in test_y]
+    #groundtruth_test = [map(lambda x: idx2label[x], y) for y in test_y]
 
-    words_test = [map(lambda x: idx2word[x], w) for w in test_lex]
-    conlleval(predictions_test,groundtruth_test,words_test, 'current.test.txt')
+    #words_test = [map(lambda x: idx2word[x], w) for w in test_lex]
+    print 'save'
+    conlleval(predictions_label,groudtrue_label,words_test, 'current.test.txt')
 
 
-
-#main()
-input_text =Segment('Data/msr_trainingtemp.utf8')
-x,y=input_text.encode_index()
-word=input_text.decode_index(x)
-
-for i,j in zip(word,y):
-    print i,j
+dic=Segment('Data/msr/msr_training.utf8')#创建词典
+model=segment_train(dic,'Data/msr/msr_training.utf8')
+segment_test(model,dic,'Data/msr/msr_test_gold.utf8')

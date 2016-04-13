@@ -2,3 +2,6 @@ Data/
 data/
 *.txt
 *.pyc
+*.xml
+*.npy
+*.iml
