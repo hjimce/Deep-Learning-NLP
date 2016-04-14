@@ -68,14 +68,18 @@ class RNNSLU(object):
 
         self.h0 = theano.shared(name='h0',value=numpy.zeros(nh,dtype=theano.config.floatX))
 
+        self.lastlabel=theano.shared(name='w',value=0.2 * numpy.random.uniform(-1.0, 1.0,(nc, nc)).astype(theano.config.floatX))
+        self.prelabel=theano.shared(name='w',value=0.2 * numpy.random.uniform(-1.0, 1.0,(nc, nc)).astype(theano.config.floatX))
+        self.bhmm=theano.shared(name='b',value=numpy.zeros(nc,dtype=theano.config.floatX))
 
-        self.params = [self.emb, self.wx, self.wh, self.w,self.bh, self.b, self.h0]#所有待学习的参数
+        self.params = [self.emb, self.wx, self.wh, self.w,self.bh, self.b, self.h0,self.lastlabel,self.prelabel,self.bhmm]#所有待学习的参数
+        lr = T.scalar('lr')#学习率，一会儿作为输入参数
+
+
 
         idxs = T.itensor3()
         x = self.emb[idxs].reshape((idxs.shape[0],idxs.shape[1],de*idxs.shape[2]))
         y_sentence = T.imatrix('y_sentence')  # 训练样本标签,二维的(batch,sentence)
-
-
         def step(x_t, h_tm1):
             h_t = T.nnet.sigmoid(T.dot(x_t, self.wx) + T.dot(h_tm1, self.wh) + self.bh)#通过ht-1、x计算隐藏层
             s_temp=T.dot(h_t, self.w) + self.b#由于softmax不支持三维矩阵操作，所以这边需要对其进行reshape成2D，计算完毕后再reshape成3D
@@ -83,31 +87,36 @@ class RNNSLU(object):
         [h,s_temp], _ = theano.scan(step,sequences=x,outputs_info=[T.ones(shape=(x.shape[1],self.h0.shape[0])) * self.h0, None])
         p_y =T.nnet.softmax(T.reshape(s_temp,(s_temp.shape[0]*s_temp.shape[1],-1)))
         p_y=T.reshape(p_y,s_temp.shape)
-        #h,p_y=step(x, self.h0)#p_y为三维矩阵，表示每个样本的值
 
-        loss=self.nll_multiclass(p_y,y_sentence)+0.0*((self.wx**2).sum()+(self.wh**2).sum()+(self.w**2).sum())
-
-        lr = T.scalar('lr')#学习率，一会儿作为输入参数
-
+        #加入前一时刻的标签约束项
+        y_label3d = T.ftensor3('y_sentence3d')
+        p_ytrain=self.add_layer(p_y,y_label3d)
+        loss=self.nll_multiclass(p_ytrain,y_sentence)+0.0*((self.wx**2).sum()+(self.wh**2).sum()+(self.w**2).sum())
         #神经网络的输出
         sentence_gradients = T.grad(loss, self.params)
-
-
-
-
-
         sentence_updates = OrderedDict((p, p - lr*g) for p, g in zip(self.params, sentence_gradients))
-        self.sentence_train = theano.function(inputs=[idxs,y_sentence,lr],outputs=loss,updates=sentence_updates)
+        self.sentence_traintemp = theano.function(inputs=[idxs,y_sentence,y_label3d,lr],outputs=loss,updates=sentence_updates)
+
+
+
+
+
+        '''self.sentence_train = theano.function(inputs=[idxs,y_sentence,lr],outputs=loss,updates=sentence_updates)'''
         #词向量归一化，因为我们希望训练出来的向量是一个归一化向量
         self.normalize = theano.function(inputs=[],updates={self.emb:self.emb /T.sqrt((self.emb**2).sum(axis=1)).dimshuffle(0, 'x')})
 
         #构造预测函数、训练函数，输入数据idxs每一行是一个样本(也就是一个窗口内的序列索引)
-        y_pred = T.argmax(p_y,axis=-1)
-        self.classify = theano.function(inputs=[idxs,y_sentence], outputs=[loss,y_pred])
-
+        #)
+        self.classify = theano.function(inputs=[idxs], outputs=p_y)
+    def add_layer(self,pre_y,y_label3d):
+        s=theano.tensor.as_tensor_variable(T.arange(T.shape(pre_y)[1]))
+        p_y_hmm_temp=T.dot(pre_y[:,s,:],self.lastlabel)+T.dot(y_label3d[:,s-1,:],self.prelabel)+self.bhmm
+        p_y_hmm =T.nnet.softmax(T.reshape(p_y_hmm_temp,(p_y_hmm_temp.shape[0]*p_y_hmm_temp.shape[1],-1)))
+        p_y_hmm=T.reshape(p_y_hmm,p_y_hmm_temp.shape)
+        return  p_y_hmm
     #训练
-    def train(self, x, y,learning_rate):
-        loss=self.sentence_train(x, y, learning_rate)
+    def train(self, x, y,y3d,learning_rate):
+        loss=self.sentence_traintemp(x, y,y3d,learning_rate)
         self.normalize()
         return  loss
     def nll_multiclass(self,p_y_given_x, y):
@@ -128,14 +137,11 @@ class RNNSLU(object):
 #为了采用batch训练，需要保证每个句子长度相同，因此这里采用均匀切分，不过有一个缺陷那就是有可能某个词刚好被切开
 def convert2batch(dic,filename,win,length=3):
     x,y=dic.encode_index(filename)#创建训练数据的索引序列
-    x2,y2=dic.encode_index('Data/msr/pku_training.utf8')#创建训练数据的索引序列
+    '''x2,y2=dic.encode_index('Data/msr/pku_training.utf8')#创建训练数据的索引序列
     x3,y3=dic.encode_index('Data/msr/1.txt')
     x4,y4=dic.encode_index('Data/msr/1998.txt')
-
-
-
     x=x+x2+x3+x4
-    y=y+y2+y3+y4
+    y=y+y2+y3+y4'''
 
 
     train_batchxs=[]
@@ -155,11 +161,27 @@ def convert2batch(dic,filename,win,length=3):
 
     #每个句子的长度不同，不能直接转换
     return  np.asarray(train_batchxs,dtype=np.int32),np.asarray(train_batchys,dtype=np.int32)
-
+def add_layer_class(rnn,pre_y):
+    result=np.zeros((pre_y.shape[0],pre_y.shape[1]))
+    s=np.shape(pre_y)[1]
+    y_0 = np.argmax(pre_y[:,0,:],axis=-1)
+    result[:,0]=y_0
+    lasty=np.zeros((pre_y.shape[0],4),dtype=np.float32)
+    lasty[:,y_0]=1
+    for i in range(s)[1:]:
+        p_y_hmm_temp=np.dot(pre_y[:,i,:],rnn.lastlabel.get_value())+np.dot(lasty,rnn.prelabel.get_value())+rnn.bhmm.get_value()
+        y_0=np.argmax(p_y_hmm_temp,axis=-1)
+        result[:,i]=y_0
+        lasty=np.zeros((pre_y.shape[0],4),dtype=np.float32)
+        lasty[:,y_0]=1
+        #p_y_hmm=T.reshape(p_y_hmm,p_y_hmm_temp.shape)
+    return  result
 
 #RNN分词
 def segment_train(dic,filename):
-    trainx,trainy=convert2batch(dic,filename,5,1000)
+
+    winsize=5#窗口大小
+    trainx,trainy=convert2batch(dic,filename,winsize,1000)
 
     '''for i,j in zip(train_xbatchs,train_ybatchs):
         for ui,uj in zip(i,j):
@@ -175,7 +197,7 @@ def segment_train(dic,filename):
     #计算相关参数
     vocsize = len(dic.word2index)#计算词的个数
     nclasses =len(dic.label2index)#标签数为B、M、E、S
-    winsize=5#窗口大小
+
     ndim=50#词向量维度
     nhidden=200#隐藏层的神经元个数
     learn_rate=0.5#梯度下降学习率
@@ -185,22 +207,31 @@ def segment_train(dic,filename):
 
     batch_size=64
     n_train_batch=trainx.shape[0]/batch_size
-    rnn.load('model/')
+    #rnn.load('model/')
+    trainy3D=np.zeros((trainy.shape[0],trainy.shape[1],nclasses),dtype=np.float32)
+    for i in range(trainy.shape[0]):
+        for j in range(trainy.shape[1])[:-1]:
+            trainy3D[i,j,trainy[i,j]]=1.
     epoch=0
     while epoch<20:
-        shuffle([trainx,trainy], 345)
+        shuffle([trainx,trainy,trainy3D], 345)
         loss=0
         for i in range(n_train_batch):
                 batx=trainx[i*batch_size:(i+1)*batch_size]
                 baty=trainy[i*batch_size:(i+1)*batch_size]
+                baty3d=trainy3D[i*batch_size:(i+1)*batch_size]
                 decay_lr=learn_rate*0.5**(epoch/50)
-                loss+=rnn.train(batx,baty,decay_lr)
+                #loss+=rnn.train(batx,baty,decay_lr)
+                loss+=rnn.train(batx,baty,baty3d,decay_lr)
+                #test=rnn.classify(batx)
+
+                #print
         print 'epoch:',epoch,'\tloss:',loss/n_train_batch
         epoch+=1
     rnn.save('model/')
     return  rnn
 def segment_test(model,dic,test_file):
-    #model.load('model/')#加载训练参数
+    model.load('model/')#加载训练参数
     x,y=dic.encode_index(test_file)#创建训练数据的索引序列
     xjieba,yjieba=dic.encode_index('Data/msr/msr_test_jieba_result.txt')#创建训练数据的索引序列
     test_batchxs=[]
@@ -210,8 +241,8 @@ def segment_test(model,dic,test_file):
     test_batchys.append(y)
 
 
-    loss,pre=model.classify(np.asarray(test_batchxs),np.asarray(test_batchys))
-    print 'loss:',loss
+    pre=model.classify(np.asarray(test_batchxs))
+    pre=add_layer_class(model,pre)
     print pre.shape
 
 
