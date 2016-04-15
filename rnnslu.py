@@ -68,9 +68,9 @@ class RNNSLU(object):
 
         self.h0 = theano.shared(name='h0',value=numpy.zeros(nh,dtype=theano.config.floatX))
 
-        self.lastlabel=theano.shared(name='w',value=0.2 * numpy.random.uniform(-1.0, 1.0,(nc, nc)).astype(theano.config.floatX))
-        self.prelabel=theano.shared(name='w',value=0.2 * numpy.random.uniform(-1.0, 1.0,(nc, nc)).astype(theano.config.floatX))
-        self.bhmm=theano.shared(name='b',value=numpy.zeros(nc,dtype=theano.config.floatX))
+        self.lastlabel=theano.shared(name='lastlabel',value=0.2 * numpy.random.uniform(-1.0, 1.0,(nc, nc)).astype(theano.config.floatX))
+        self.prelabel=theano.shared(name='prelabel',value=0.2 * numpy.random.uniform(-1.0, 1.0,(nc, nc)).astype(theano.config.floatX))
+        self.bhmm=theano.shared(name='bhmm',value=numpy.zeros(nc,dtype=theano.config.floatX))
 
         self.params = [self.emb, self.wx, self.wh, self.w,self.bh, self.b, self.h0,self.lastlabel,self.prelabel,self.bhmm]#所有待学习的参数
         lr = T.scalar('lr')#学习率，一会儿作为输入参数
@@ -137,11 +137,11 @@ class RNNSLU(object):
 #为了采用batch训练，需要保证每个句子长度相同，因此这里采用均匀切分，不过有一个缺陷那就是有可能某个词刚好被切开
 def convert2batch(dic,filename,win,length=3):
     x,y=dic.encode_index(filename)#创建训练数据的索引序列
-    '''x2,y2=dic.encode_index('Data/msr/pku_training.utf8')#创建训练数据的索引序列
+    x2,y2=dic.encode_index('Data/msr/pku_training.utf8')#创建训练数据的索引序列
     x3,y3=dic.encode_index('Data/msr/1.txt')
     x4,y4=dic.encode_index('Data/msr/1998.txt')
     x=x+x2+x3+x4
-    y=y+y2+y3+y4'''
+    y=y+y2+y3+y4
 
 
     train_batchxs=[]
@@ -207,7 +207,7 @@ def segment_train(dic,filename):
 
     batch_size=64
     n_train_batch=trainx.shape[0]/batch_size
-    #rnn.load('model/')
+    rnn.load('model/')
     trainy3D=np.zeros((trainy.shape[0],trainy.shape[1],nclasses),dtype=np.float32)
     for i in range(trainy.shape[0]):
         for j in range(trainy.shape[1])[:-1]:
@@ -240,8 +240,9 @@ def segment_test(model,dic,test_file):
     test_batchxs.append(s)
     test_batchys.append(y)
 
-
-    pre=model.classify(np.asarray(test_batchxs))
+    test_batchxs=np.asarray(test_batchxs)
+    print test_batchxs.shape
+    pre=model.classify(test_batchxs)
     pre=add_layer_class(model,pre)
     print pre.shape
 
